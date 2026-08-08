@@ -1,0 +1,54 @@
+{
+  "name": "flashapp-desktop",
+  "version": "1.2.1",
+  "description": "FLASHApp as a cross-platform desktop app (Electron + bundled Python)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^38.8.6",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "org.openms.flashapp",
+    "productName": "FLASHApp",
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "app",
+        "to": "app"
+      },
+      {
+        "from": "runtime",
+        "to": "runtime"
+      },
+      {
+        "from": "topp",
+        "to": "topp"
+      }
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.education",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "resources/entitlements.mac.plist",
+      "entitlementsInherit": "resources/entitlements.mac.plist"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Science"
+    },
+    "directories": {
+      "buildResources": "resources"
+    }
+  }
+}

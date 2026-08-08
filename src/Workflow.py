@@ -76,17 +76,17 @@ class TagWorkflow(WorkflowManager):
 
 
     def execution(self) -> None:
-        # Get input files
-        try:      
+        # Get input files. These must RAISE, not st.error+return: execution()
+        # runs in the detached workflow process, where st.error goes nowhere and
+        # the caller then logs "WORKFLOW FINISHED" over a run that did nothing.
+        try:
             in_mzmls = self.file_manager.get_files(self.params["mzML-files"])
         except ValueError:
-            st.error('Please select at least one mzML file.')  
-            return
-        try: 
+            raise ValueError("Select at least one mzML file on the Data tab.")
+        try:
             database = self.file_manager.get_files(self.params["fasta-file"])
         except ValueError:
-            st.error('Please select a database.')  
-            return
+            raise ValueError("Select a sequence database on the Data tab.")
         
         # Make sure output directory exists
         base_path = dirname(self.workflow_dir)
@@ -282,12 +282,11 @@ class DeconvWorkflow(WorkflowManager):
 
     def execution(self) -> None:
         # Get input files
-        try:      
+        try:
             in_mzmls = self.file_manager.get_files(self.params["mzML-files"])
         except ValueError:
-            st.error('Please select at least one mzML file.')  
-            return
-        
+            raise ValueError("Select at least one mzML file on the Data tab.")
+
         # Define output directory
         base_path = dirname(self.workflow_dir)
 

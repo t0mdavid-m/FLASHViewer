@@ -1,4 +1,5 @@
 import gzip
+import os
 import shutil
 import string
 import random
@@ -10,6 +11,58 @@ import pickle as pkl
 from io import BytesIO
 from pathlib import Path
 from typing import Union, List
+
+# Set by the Electron shell. On the desktop the data is already on this machine,
+# so files are referenced where they lie instead of being copied into the cache:
+# MS runs are routinely gigabytes and copying doubles disk use for no benefit.
+DESKTOP = os.environ.get("FLASHAPP_DESKTOP") == "1"
+
+
+def safe_component(value: str, what: str = "name") -> str:
+    """A dataset id or file name that is safe to join onto a directory.
+
+    Dataset ids are derived from user-supplied filenames, and on the hosted
+    deployment the filename arrives straight from a multipart request, which
+    Streamlit does not sanitise. Both are joined into
+    <cache>/files/<dataset_id>/<file_name> and the directory is later rmtree'd,
+    so a value containing ".." or a separator writes and deletes outside the
+    cache entirely. Verified: store_file("../../..", …, file_name="victim.txt")
+    overwrote a file three levels up before this guard existed.
+
+    Rejects rather than sanitises: a silently rewritten dataset id would break
+    the filename-based grouping the upload pages depend on.
+    """
+    text = str(value)
+    if not text or text in (".", ".."):
+        raise ValueError(f"unsafe {what}: {value!r}")
+    # "/" and NUL are never legal in a component. Backslash is a separator on
+    # Windows but a legal filename character on POSIX, so rejecting it outright
+    # would refuse real files on macOS and Linux — reject it only where the OS
+    # would actually treat it as a separator.
+    separators = {"/", os.sep, os.altsep} - {None}
+    if "\0" in text or any(sep in text for sep in separators):
+        raise ValueError(f"unsafe {what}: {value!r}")
+    if Path(text).name != text or Path(text).is_absolute():
+        raise ValueError(f"unsafe {what}: {value!r}")
+    return text
+
+
+def _identifier(name: str) -> str:
+    """Validate a SQL table or column name that has to be interpolated.
+
+    Values are bound as parameters, but SQLite cannot parameterise identifiers,
+    and this schema creates columns at runtime from caller-supplied name tags.
+    Rather than quote-and-hope, anything that is not a plain identifier is
+    rejected outright — the tags are all code constants, so a rejection is a
+    programming error, not user input.
+    """
+    name = str(name)
+    if not name or not (name[0].isalpha() or name[0] == "_"):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    if not all(c.isalnum() or c == "_" for c in name):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return name
+
 
 class FileManager:
     """
@@ -247,7 +300,7 @@ class FileManager:
         # Add column to table if it does not exist
         if column_name not in columns:
             self.cache_cursor.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT;"
+                f"ALTER TABLE {table_name} ADD COLUMN {_identifier(column_name)} TEXT;"
             )
 
     def _add_entry(self, table_name: str, dataset_id: str, 
@@ -266,13 +319,16 @@ class FileManager:
         # Ensure column exists
         self._add_column(table_name, column_name)
 
-        # Store reference
+        # Store reference. dataset_id and path are user-derived — a filename
+        # containing a quote used to break every later query against the
+        # workspace, permanently and unrecoverably from inside the app.
+        col = _identifier(column_name)
         self.cache_cursor.execute(f"""
-            INSERT INTO {table_name} (id, {column_name})
-            VALUES ("{dataset_id}", "{path}")
-            ON CONFLICT(id) 
-            DO UPDATE SET {column_name} = excluded.{column_name};
-        """)
+            INSERT INTO {_identifier(table_name)} (id, {col})
+            VALUES (?, ?)
+            ON CONFLICT(id)
+            DO UPDATE SET {col} = excluded.{col};
+        """, (str(dataset_id), str(path)))
 
     def _store_data(self, dataset_id: str, name_tag: str, data) -> None:
         """
@@ -322,8 +378,26 @@ class FileManager:
         # Store reference in index
         self._add_entry('stored_data', dataset_id, name_tag, data_path)
         
-    def store_file(self, dataset_id: str, name_tag: str, file: Path | BytesIO, 
-                   remove: bool = True, file_name = None) -> None:
+    def _is_ours(self, path: Path) -> bool:
+        """Does this file live inside storage we created and may delete?
+
+        Anything under the workflow directory or the cache is ours; anything
+        else belongs to the user and is never unlinked.
+        """
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        for root in (self.workflow_dir, self.cache_path):
+            try:
+                resolved.relative_to(Path(root).resolve())
+                return True
+            except (ValueError, OSError):
+                continue
+        return False
+
+    def store_file(self, dataset_id: str, name_tag: str, file: Path | BytesIO,
+                   remove: bool = True, file_name = None, link: bool = None) -> None:
         """
         Stores a given file.
 
@@ -334,13 +408,37 @@ class FileManager:
             file (Path of File-Like): The file that should be stored.
             remove (bool): Wether or not the file should be removed
                 after copying it.
-            filetype (str): The file extension of the file. Only 
+            filetype (str): The file extension of the file. Only
                 neccessary if a file-like object is used as input.
+            link (bool): Reference the file where it is instead of copying it
+                into the cache. Defaults to True on the desktop app for real
+                paths. A linked file is never removed, whatever `remove` says —
+                it belongs to the user, not to the workspace.
         """
+        # Ownership, not type. Inferring link from "is it a Path on desktop"
+        # linked the workflow's own outputs, which live in a per-run temp
+        # directory that Workflow.py deletes moments later — leaving index rows
+        # pointing at deleted files. Only a call site that knows the file
+        # belongs to the user may ask for linking.
+        if link is None:
+            link = False
 
-        # Define storage path
+        if link:
+            # remove_results()/clear_cache() only delete inside cache_path, so a
+            # linked original is never touched by deleting the dataset.
+            self._add_entry('stored_files', dataset_id, name_tag, Path(file).resolve())
+            return
+
+        # Define storage path.
+        # Not file.suffix: Streamlit's UploadedFile subclasses BytesIO and has
+        # no .suffix, so reading it here — before the file-like branch below —
+        # raised AttributeError for every browser upload, which is the only
+        # path all three "manual result upload" pages use.
+        dataset_id = safe_component(dataset_id, "dataset id")
         if file_name is None:
-            file_name = f"{name_tag}{file.suffix}"
+            suffix = Path(getattr(file, "name", "")).suffix if not isinstance(file, Path) else file.suffix
+            file_name = f"{name_tag}{suffix}"
+        file_name = safe_component(file_name, "file name")
         
         target_path = Path(
                 self.cache_path, 'files', dataset_id, file_name
@@ -352,9 +450,13 @@ class FileManager:
             with open(target_path, 'wb') as f:
                 f.write(file.getbuffer())
         else:
-            file = Path(file)            
+            file = Path(file)
             shutil.copy(file, target_path)
-            if remove:
+            # remove=True means "this was our scratch copy, tidy it up". It must
+            # never mean "delete the user's data". Callers pass user-chosen
+            # paths here — the desktop file picker does — so ownership is
+            # checked here rather than trusted from the call site.
+            if remove and self._is_ours(file):
                 file.unlink()
 
         # Store reference in index
@@ -407,10 +509,10 @@ class FileManager:
         file_columns = [c for c in file_columns if c in name_tags]
         if len(file_columns) > 0:
             self.cache_cursor.execute(f"""
-                SELECT {', '.join(file_columns)}
+                SELECT {', '.join(_identifier(c) for c in file_columns)}
                 FROM stored_files
-                WHERE id = '{dataset_id}';
-            """)
+                WHERE id = ?;
+            """, (str(dataset_id),))
             result = self.cache_cursor.fetchone()
             for c, r in zip(file_columns, result):
                 if r is None:
@@ -424,10 +526,10 @@ class FileManager:
         data_columns = [c for c in data_columns if c in name_tags]
         if len(data_columns) > 0:
             self.cache_cursor.execute(f"""
-                SELECT {', '.join(data_columns)}
+                SELECT {', '.join(_identifier(c) for c in data_columns)}
                 FROM stored_data
-                WHERE id = '{dataset_id}';
-            """)
+                WHERE id = ?;
+            """, (str(dataset_id),))
             result = self.cache_cursor.fetchone()
             for c, r in zip(data_columns, result):
                 if r is None:
@@ -456,10 +558,10 @@ class FileManager:
         
         # Check if field value is set
         self.cache_cursor.execute(f"""
-            SELECT {name_tag} 
-            FROM {table} 
-            WHERE id = '{dataset_id}' AND {name_tag} IS NOT NULL
-        """)
+            SELECT {_identifier(name_tag)}
+            FROM {_identifier(table)}
+            WHERE id = ? AND {_identifier(name_tag)} IS NOT NULL
+        """, (str(dataset_id),))
         if self.cache_cursor.fetchone():
             return True
         return False
@@ -469,15 +571,19 @@ class FileManager:
         # Remove references
         self.cache_cursor.execute(f"""
             DELETE FROM stored_data
-            WHERE id = '{dataset_id}';
-        """)
+            WHERE id = ?;
+        """, (str(dataset_id),))
         self.cache_cursor.execute(f"""
             DELETE FROM stored_files
-            WHERE id = '{dataset_id}';
-        """)
+            WHERE id = ?;
+        """, (str(dataset_id),))
 
-        # Remove stored files
-        shutil.rmtree(Path(self.cache_path, 'files', dataset_id))
+        # Remove stored files. A dataset whose files are all linked has no
+        # directory here at all, so this must tolerate its absence.
+        # safe_component: this path is rmtree'd, so a ".." id would delete
+        # outside the cache.
+        shutil.rmtree(Path(self.cache_path, 'files', safe_component(dataset_id, 'dataset id')),
+                      ignore_errors=True)
 
     def clear_cache(self):
         shutil.rmtree(Path(self.cache_path, 'files'))

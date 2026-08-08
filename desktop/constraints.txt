@@ -1,0 +1,9 @@
+# The 3.5.0 macOS wheels ship both libomp.dylib and libgomp.1.dylib; importing
+# pyopenms aborts with "OMP: Error #15". 3.4.0 predates that but has no
+# linux-aarch64 wheel, so pin it only where the bug actually is.
+pyopenms==3.4.0; sys_platform == "darwin"
+
+# Streamlit is deliberately unpinned. It used to be held at 1.42.2 because
+# src/common/captcha_.py imported four private streamlit.source_util symbols
+# that 1.43 removed — but the functions using them were dead code, so deleting
+# them lifted the ceiling. Verified running on 1.60.

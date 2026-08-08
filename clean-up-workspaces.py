@@ -5,8 +5,18 @@ import time
 import shutil
 from datetime import datetime
 
-# Define the workspaces directory
-workspaces_directory = Path("/workspaces-flashapp")
+# Define the workspaces directory.
+# This must match what the app actually writes: page_setup() uses
+# Path("..", "workspaces-" + settings["repository-name"]), i.e.
+# ../workspaces-FLASHViewer relative to the app directory. The previous value,
+# /workspaces-flashapp, matched nothing, so the hosted janitor silently
+# reclaimed no disk at all. Override with FLASHAPP_WORKSPACES if the deployment
+# puts them elsewhere.
+workspaces_directory = Path(
+    os.environ.get("FLASHAPP_WORKSPACES", Path(__file__).resolve().parent.parent / "workspaces-FLASHViewer")
+)
+if not workspaces_directory.is_dir():
+    raise SystemExit(f"workspaces directory not found: {workspaces_directory}")
 
 # Get the current time in seconds
 current_time = time.time()

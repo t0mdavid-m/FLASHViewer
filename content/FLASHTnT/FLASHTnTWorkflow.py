@@ -5,7 +5,9 @@ from pathlib import Path
 
 from src.parse.tnt import parseTnT
 from src.Workflow import TagWorkflow
-from src.common.common import page_setup
+from src.common.common import page_setup, desktop_file_picker
+from src.workflow.StreamlitUI import DESKTOP
+from src import confirm
 
 
 params = page_setup()
@@ -14,7 +16,18 @@ wf = TagWorkflow()
 
 st.title('FLASHTnT - Tag and Extend')
 
-t = st.tabs(["📁 **File Upload**", "⚙️ **Configure**", "🚀 **Run**", "💡 **Manual Result Upload**"])
+# Wizard banner. Mounted ABOVE st.tabs deliberately: it must not sit inside a
+# tab body, because st.tabs renders every body on load and execution() depends
+# on that. State is derived in src/tools.py; nothing here constructs a
+# FileManager for another tool.
+from src import wizard
+from src.tools import TOOLS
+_spec = TOOLS["FLASHTnT"]
+_files_dir = Path(wf.workflow_dir, "input-files", "mzML-files")
+_selected = wizard.selected_names(wf.params, "mzML-files")
+wizard.banner(wizard.build_steps(_spec, wf, wf.params, _files_dir, _selected))
+
+t = st.tabs(["**Data**", "**Method**", "**Run**", "**Add results**"])
 with t[0]:
     wf.show_file_upload_section()
 
@@ -63,20 +76,42 @@ with t[3]:
         ))
         unparsed_files = input_files - parsed_files
 
-        # Process unparsed datasets
-        for unparsed_dataset in (unparsed_files):
-            results = wf.file_manager.get_results(
-                unparsed_dataset, 
-                ['out_deconv_mzML', 'anno_annotated_mzML', 'tags_tsv', 'protein_tsv']
-            )
-            
+        # Process unparsed datasets. Parsing is a phase of the work, not a
+        # silent gap after it: on real data this runs for minutes.
+        pending = sorted(unparsed_files)
+        if pending:
+            _status = st.status(f"Parsing {len(pending)} dataset(s)…", expanded=True)
+            _progress = _status.progress(0.0)
+        REQUIRED = ['out_deconv_mzML', 'anno_annotated_mzML', 'tags_tsv', 'protein_tsv']
+        for _i, unparsed_dataset in enumerate(pending):
+            _status.write(f"Parsing {unparsed_dataset} ({_i + 1}/{len(pending)})")
+            results = wf.file_manager.get_results(unparsed_dataset, REQUIRED)
+
+            # get_results only returns tags whose column exists, and
+            # get_results_list drops absent columns from its AND query — so a
+            # dataset with only the two mzMLs reaches this point and used to
+            # raise a bare KeyError: 'tags_tsv'. FLASHTnT needs all four.
+            missing = [tag for tag in REQUIRED if tag not in results]
+            if missing:
+                _status.write(
+                    f":orange[Skipped {unparsed_dataset} — FLASHTnT needs all four "
+                    f"files; missing: {', '.join(missing)}]"
+                )
+                _progress.progress((_i + 1) / len(pending))
+                continue
+
             parsed_data = parseTnT(
-                results['out_deconv_mzML'], results['anno_annotated_mzML'], 
+                results['out_deconv_mzML'], results['anno_annotated_mzML'],
                 results['tags_tsv'], results['protein_tsv']
             )
 
             for k, v in parsed_data.items():
                 wf.file_manager.store_data(unparsed_dataset, k, v)
+            _progress.progress((_i + 1) / len(pending))
+
+        if pending:
+            _status.update(label=f"Parsed {len(pending)} dataset(s)", state="complete",
+                           expanded=False)
 
     tabs = st.tabs(["File Upload", "Example Data"])
 
@@ -106,17 +141,28 @@ with t[3]:
         # Display info how to upload files
         st.info(
             """
-        **💡 How to upload files**
+        **How to upload files**
         
         1. Browse files on your computer or drag and drops files
         2. Click the **Add files to workspace** button to use them in the viewer
         
         Select data for analysis from the uploaded files shown below.
         
-        **💡 Make sure that the same number of deconvolved and annotated mzML and FLASHTagger output files files are uploaded!**
+        **Make sure that the same number of deconvolved and annotated mzML and FLASHTagger output files files are uploaded!**
         """
         )
-        with st.form('input_mzML', clear_on_submit=True):
+        if DESKTOP:
+            # No upload step: reference the files where they already are.
+            picked = desktop_file_picker(
+                "Add FLASHDeconv & FLASHTagger output files", ["mzML", "tsv"],
+                key="tnt_pick",
+            )
+            if picked:
+                process_uploaded_files(picked)
+                st.success(f"Added {len(picked)} file(s).")
+                st.rerun()
+        else:
+          with st.form('input_mzML', clear_on_submit=True):
             uploaded_file = st.file_uploader(
                 "FLASHDeconv & FLASHTagger output files", accept_multiple_files=True, type=["mzML", "tsv"]
             )
@@ -175,7 +221,7 @@ with t[3]:
     st.dataframe(pd.DataFrame(table))
 
    # Remove files
-    with st.expander("🗑️ Remove mzML files"):
+    with st.expander("Remove datasets"):
         to_remove = st.multiselect(
             "select files", options=experiments
         )
@@ -187,7 +233,20 @@ with t[3]:
                 wf.file_manager.remove_results(dataset_id)
             st.rerun()
 
-        if c1.button("⚠️ Remove **all**"):
-            wf.file_manager.clear_cache()
-            st.success("All files removed!")
-            st.rerun()
+        # Unbounded and unrecoverable: clear_cache() drops both SQLite tables and
+        # rmtree's <cache>/files. It had no confirmation at all.
+        if c1.button("Remove **all**", icon=":material/delete_forever:"):
+            st.session_state["armed_clear_FLASHTnT"] = True
+        if st.session_state.get("armed_clear_FLASHTnT"):
+            def _clear_FLASHTnT():
+                wf.file_manager.clear_cache()
+                st.session_state.pop("armed_clear_FLASHTnT", None)
+                st.rerun()
+            confirm.confirm_typed(
+                title="Remove every FLASHTnT dataset",
+                body="This deletes every dataset in this workspace for FLASHTnT, "
+                     "including parsed results. It cannot be undone.",
+                phrase="FLASHTnT",
+                confirm_label="Remove all FLASHTnT datasets",
+                on_confirm=_clear_FLASHTnT,
+            )

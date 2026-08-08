@@ -1,0 +1,128 @@
+name: desktop
+on:
+  push:
+    branches: [desktop]
+    tags: ['desktop-v*']
+  workflow_dispatch:
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Intel macOS is built again. Rosetta translates x86 -> Apple Silicon,
+          # not the reverse, so without this an Intel Mac has nothing to run.
+          # The label matters: macos-13 is retired and macos-14 is deprecated
+          # (GitHub brownouts then removes deprecated images), so both macOS
+          # targets sit on 15.
+          - { os: macos-15,         target: macOS-arm64  }
+          - { os: macos-15-intel,   target: macOS-x64    }
+          - { os: ubuntu-24.04,     target: Linux-x64    }
+          - { os: ubuntu-24.04-arm, target: Linux-arm64  }
+          - { os: windows-2022,     target: Windows-x64  }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run: { shell: bash, working-directory: desktop }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      # secrets.* is illegal inside if:, so map presence to a step output instead.
+      - id: gate
+        env:
+          MAC_CERT: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          [ -n "$MAC_CERT" ] && echo "mac=true" >> $GITHUB_OUTPUT || echo "mac=false" >> $GITHUB_OUTPUT
+          [ -n "$SIGNPATH" ] && echo "win=true" >> $GITHUB_OUTPUT || echo "win=false" >> $GITHUB_OUTPUT
+
+      - run: ./build.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build installer
+        env:
+          CSC_LINK: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ steps.gate.outputs.mac }}
+        run: |
+          npm install
+          if [ "$RUNNER_OS" = "macOS" ] && [ "${{ steps.gate.outputs.mac }}" = "true" ]; then
+            npx electron-builder --publish never --config.mac.notarize=true
+          else
+            # An absent secret still arrives as an empty string, and electron-builder
+            # reads an empty CSC_LINK as "a cert was supplied", then fails resolving
+            # it against the project dir: "<projectDir> not a file".
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            npx electron-builder --publish never
+          fi
+
+      - name: Verify macOS signature
+        if: runner.os == 'macOS' && steps.gate.outputs.mac == 'true'
+        run: |
+          APP=$(find dist -maxdepth 2 -name 'FLASHApp.app' | head -1)
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl -a -vv "$APP"
+
+      # SignPath keeps the private key in its HSM; the runner never sees a cert.
+      # upload-artifact always zips, so the SignPath artifact configuration must be
+      # <zip-file><pe-file path="*.exe"><authenticode-sign/></pe-file></zip-file>.
+      - name: Upload unsigned exe for signing
+        id: upload
+        if: runner.os == 'Windows' && steps.gate.outputs.win == 'true'
+        uses: actions/upload-artifact@v4
+        with: { name: unsigned-exe, path: desktop/dist/*.exe }
+
+      - name: Sign with SignPath
+        if: runner.os == 'Windows' && steps.gate.outputs.win == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: flashapp
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: desktop/dist-signed
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FLASHApp-${{ matrix.target }}
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.AppImage
+            desktop/dist/*.exe
+            desktop/dist-signed/*.exe
+          if-no-files-found: error
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          # Recursive: upload-artifact computes the archive root from the least
+          # common ancestor of the matched files, so a multi-path `path:` keeps a
+          # `dist/` prefix and the installers land one level below `artifacts/`.
+          # `artifacts/*` matched only directories and attached nothing.
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.AppImage
+            artifacts/**/*.exe
+          # Without this the step prints "does not match any files" and still
+          # succeeds, producing an empty release that looks published. Tagging
+          # must fail loudly instead.
+          fail_on_unmatched_files: true

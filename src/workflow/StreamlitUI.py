@@ -15,12 +15,20 @@ from datetime import datetime
 from streamlit_js_eval import streamlit_js_eval
 
 
+from src.tools import input_listing, record_intent
 from src.common.common import (
     OS_PLATFORM,
     TK_AVAILABLE,
     tk_directory_dialog,
     tk_file_dialog,
+    electron_dialog,
 )
+
+# The Electron shell sets this. In a desktop app the data already lives on the
+# user's disk, so copying it through a browser upload is pure overhead — it
+# doubles disk use and imposes a size ceiling on files that are routinely
+# gigabytes. Desktop therefore references paths instead of copying.
+DESKTOP = os.environ.get("FLASHAPP_DESKTOP") == "1"
 
 
 class StreamlitUI:
@@ -75,19 +83,25 @@ class StreamlitUI:
             name = key.replace("-", " ")
 
         c1, c2 = st.columns(2)
-        c1.markdown("**Upload file(s)**")
 
-        if st.session_state.location == "local":
-            c2_text, c2_checkbox = c2.columns([1.5, 1], gap="large")
-            c2_text.markdown("**OR add files from local folder**")
-            use_copy = c2_checkbox.checkbox(
-                "Make a copy of files",
-                key=f"{key}-copy_files",
-                value=True,
-                help="Create a copy of files in workspace.",
-            )
+        if DESKTOP:
+            # No uploader at all: the files are already on this machine.
+            c1.markdown("**Add file(s) from this computer**")
+            c2.markdown("**OR add a whole folder**")
+            use_copy = False
         else:
-            use_copy = True
+            c1.markdown("**Upload file(s)**")
+            if st.session_state.location == "local":
+                c2_text, c2_checkbox = c2.columns([1.5, 1], gap="large")
+                c2_text.markdown("**OR add files from local folder**")
+                use_copy = c2_checkbox.checkbox(
+                    "Make a copy of files",
+                    key=f"{key}-copy_files",
+                    value=True,
+                    help="Create a copy of files in workspace.",
+                )
+            else:
+                use_copy = True
 
         # Convert file_types to a list if it's a string
         if isinstance(file_types, str):
@@ -118,6 +132,8 @@ class StreamlitUI:
                             ] and any(f.name.endswith(ft) for ft in file_types):
                                 with open(Path(files_dir, f.name), "wb") as fh:
                                     fh.write(f.getbuffer())
+                        record_intent(self.workflow_dir, "data",
+                                      source="upload", count=len(files))
                         st.success("Successfully added uploaded files!")
                         st.rerun()
                     else:
@@ -131,12 +147,12 @@ class StreamlitUI:
             c1.write("\n")
             with c1.container(border=True):
                 dialog_button = st.button(
-                    rf"$\textsf{{\Large 📁 Add }} \textsf{{ \Large \textbf{{{name}}} }}$",
+                    rf"$\textsf{{\Large Add }} \textsf{{ \Large \textbf{{{name}}} }}$",
                     type="primary",
                     use_container_width=True,
                     key="local_browse_single",
                     help="Browse for your local MS data files.",
-                    disabled=not TK_AVAILABLE,
+                    disabled=not (DESKTOP or TK_AVAILABLE),
                 )
 
                 # Tk file dialog requires file types to be a list of tuples
@@ -148,11 +164,19 @@ class StreamlitUI:
                     raise ValueError("'file_types' must be either of type str or list")
 
                 if dialog_button:
-                    local_files = tk_file_dialog(
-                        "Select your local MS data files",
-                        tk_file_types,
-                        st.session_state["previous_dir"],
-                    )
+                    # Tk aborts the process when used off the main thread on
+                    # macOS, and Streamlit page code never runs on it. In the
+                    # desktop app Electron owns the dialog instead.
+                    if DESKTOP:
+                        local_files = [str(p) for p in electron_dialog(
+                            file_types=file_types,
+                            title="Select your local MS data files")]
+                    else:
+                        local_files = tk_file_dialog(
+                            "Select your local MS data files",
+                            tk_file_types,
+                            st.session_state["previous_dir"],
+                        )
                     if local_files:
                         my_bar = st.progress(0)
                         for i, f in enumerate(local_files):
@@ -161,6 +185,8 @@ class StreamlitUI:
                         my_bar.empty()
                         st.success("Successfully added files!")
 
+                        record_intent(self.workflow_dir, "data",
+                                      source="reference", count=len(local_files))
                         st.session_state["previous_dir"] = Path(local_files[0]).parent
                         st.rerun()
 
@@ -175,16 +201,22 @@ class StreamlitUI:
                     st.write("\n")
                     st.write("\n")
                     dialog_button = st.button(
-                        "📁",
+                        "",
                         key=f"local_browse_{key}",
                         help="Browse for your local directory with MS data.",
-                        disabled=not TK_AVAILABLE,
+                        disabled=not (DESKTOP or TK_AVAILABLE),
                     )
                     if dialog_button:
-                        st.session_state["local_dir"] = tk_directory_dialog(
-                            "Select directory with your MS data",
-                            st.session_state["previous_dir"],
-                        )
+                        if DESKTOP:
+                            chosen = electron_dialog(
+                                title="Select directory with your MS data",
+                                directory=True)
+                            st.session_state["local_dir"] = str(chosen[0]) if chosen else ""
+                        else:
+                            st.session_state["local_dir"] = tk_directory_dialog(
+                                "Select directory with your MS data",
+                                st.session_state["previous_dir"],
+                            )
                         st.session_state["previous_dir"] = st.session_state["local_dir"]
 
                 with st_cols[1]:
@@ -250,39 +282,37 @@ class StreamlitUI:
                     "This means that the original files will be used instead. "
                 )
 
-        if fallback and not any([f for f in Path(files_dir).iterdir() if f.name != "external_files.txt"]):
-            if isinstance(fallback, str):
-                fallback = [fallback]
-            for f in fallback:
-                c1, _ = st.columns(2)
-                if not Path(files_dir, f).exists():
+        if isinstance(fallback, str):
+            fallback = [fallback]
+        # The desktop build strips example-data/ from the payload (101 MB of
+        # samples), so the fallback files may simply not exist. Copying them
+        # unconditionally raised FileNotFoundError before the page could render,
+        # which left desktop with no way to add input data at all.
+        available_fallback = [f for f in (fallback or []) if Path(f).exists()]
+
+        # Files added by reference live in external_files.txt, not in files_dir.
+        # Emptiness has to account for both, or a referenced file is invisible:
+        # files_dir looks empty, the fallback branch below wins, and it only ever
+        # listed files_dir — so on desktop, where every added file is referenced,
+        # picking a file appeared to do nothing at all.
+        copied_present, external_list = input_listing(files_dir)
+
+        if fallback and not copied_present and not external_list:
+            c1, _ = st.columns(2)
+            for f in available_fallback:
+                if not Path(files_dir, Path(f).name).exists():
                     shutil.copy(f, Path(files_dir, Path(f).name))
             current_files = [f.name for f in files_dir.iterdir() if f.name != "external_files.txt"]
-            c1.warning("**No data yet. Using example data file(s).**")
-        else:
-            if files_dir.exists():
-                current_files = [
-                    f.name
-                    for f in files_dir.iterdir()
-                    if "external_files.txt" not in f.name
-                ]
-
-                # Check if local files are available
-                external_files = Path(
-                    self.workflow_dir, "input-files", key, "external_files.txt"
-                )
-
-                if external_files.exists():
-                    with open(external_files, "r") as f:
-                        external_files_list = f.read().splitlines()
-                    # Only make files available that still exist
-                    current_files += [
-                        f"(local) {Path(f).name}"
-                        for f in external_files_list
-                        if os.path.exists(f)
-                    ]
+            if available_fallback:
+                c1.warning("**No data yet. Using example data file(s).**")
             else:
-                current_files = []
+                c1.info(
+                    "**No data yet.** This build does not ship example data — "
+                    "add your own files above to get started."
+                )
+        else:
+            current_files = [f.name for f in copied_present]
+            current_files += [f"(local) {Path(f).name}" for f in external_list]
 
         if files_dir.exists() and not any(files_dir.iterdir()):
             shutil.rmtree(files_dir)
@@ -291,7 +321,7 @@ class StreamlitUI:
         if current_files:
             c1.info(f"Current **{name}** files:\n\n" + "\n\n".join(current_files))
             if c1.button(
-                f"🗑️ Clear **{name}** files.",
+                f"Clear **{name}** files.",
                 use_container_width=True,
                 key=f"remove-files-{key}",
             ):
@@ -930,7 +960,7 @@ class StreamlitUI:
 
         # Display a download button for the zip file in Streamlit
         c1.download_button(
-            label="⬇️ Download Now",
+            label="Download Now",
             data=bytes_io,
             file_name="input-files.zip",
             mime="application/zip",
@@ -940,7 +970,7 @@ class StreamlitUI:
     def file_upload_section(self, custom_upload_function) -> None:
         custom_upload_function()
         c1, _ = st.columns(2)
-        if c1.button("⬇️ Download files", use_container_width=True):
+        if c1.button("Download files", use_container_width=True):
             self.zip_and_download_files(Path(self.workflow_dir, "input-files"))
 
     def parameter_section(self, custom_parameter_function) -> None:
@@ -953,7 +983,7 @@ class StreamlitUI:
         cols = st.columns(3)
         with cols[0]:
             if st.button(
-                "⚠️ Load default parameters",
+                "Load default parameters",
                 help="Reset paramter section to default.",
                 use_container_width=True,
             ):
@@ -963,7 +993,7 @@ class StreamlitUI:
             if self.parameter_manager.params_file.exists():
                 with open(self.parameter_manager.params_file, "rb") as f:
                     st.download_button(
-                        "⬇️ Export parameters",
+                        "Export parameters",
                         data=f,
                         file_name="parameters.json",
                         mime="text/json",
@@ -972,7 +1002,7 @@ class StreamlitUI:
                     )
             text = self.export_parameters_markdown()
             st.download_button(
-                "📑 Method summary",
+                "Method summary",
                 data=text,
                 file_name="method-summary.md",
                 mime="text/md",
@@ -982,7 +1012,7 @@ class StreamlitUI:
 
         with cols[2]:
             up = st.file_uploader(
-                "⬆️ Import parameters", help="Reset parameter section to default."
+                "Import parameters", help="Reset parameter section to default."
             )
             if up is not None:
                 with open(self.parameter_manager.params_file, "w") as f:
@@ -1110,7 +1140,17 @@ class StreamlitUI:
         citation_position = 3
 
         url = f"https://github.com/{st.session_state.settings['github-user']}/{st.session_state.settings['repository-name']}"
-        tools = [p.stem for p in Path(self.parameter_manager.ini_dir).iterdir()]
+        # ini files only exist once a TOPP tool has written one. A build with no
+        # TOPP binaries — the desktop package without OPENMS_BIN — has none, and
+        # the joins below then raised IndexError on an empty list, taking down
+        # the whole Configure tab.
+        ini_dir = Path(self.parameter_manager.ini_dir)
+        tools = [p.stem for p in ini_dir.iterdir()] if ini_dir.exists() else []
+        if not tools:
+            return (
+                "No TOPP tools are available in this build, so no methods "
+                "description can be generated."
+            )
         tool_text = []
         cited_tools = []
         for tool in tools:

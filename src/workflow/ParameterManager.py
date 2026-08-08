@@ -1,8 +1,33 @@
 import pyopenms as poms
 import json
+
+from src.tools import record_intent
+
 import shutil
 import streamlit as st
 from pathlib import Path
+
+
+def method_only(params):
+    """params.json minus the input-file selections.
+
+    select_input_file writes the chosen inputs into the same file as the method
+    parameters, so a whole-file diff marked "Method: changed from defaults" the
+    moment a user picked an mzML file on the Data step. Input selections are
+    recognised by their value -- paths under the workspace's own input-files/ --
+    rather than by a key naming convention or a widget registration order that
+    render order controls.
+    """
+    def is_selection(value):
+        # An empty list counts too: that is the "nothing chosen yet" state the
+        # selection starts in, and without it the very first pick still reads as
+        # a change. The cost is that a genuine method parameter holding an empty
+        # list carries no intent — no such parameter exists in any of the three
+        # tools, and under-reporting here is the safe direction.
+        items = value if isinstance(value, list) else [value]
+        return all(isinstance(v, str) and "input-files" in v for v in items)
+
+    return {k: v for k, v in params.items() if not is_selection(v)}
 
 class ParameterManager:
     """
@@ -73,9 +98,25 @@ class ParameterManager:
                     ):
                         # store non-default value
                         json_params[tool][key.split(":1:")[1]] = value
+        # Record deliberate parameter change — but ONLY when the dict actually
+        # differs from what is already on disk. This method runs on every widget
+        # render (input_widget / input_TOPP call it unconditionally), so the mere
+        # existence of params.json proves nothing about user intent; that is why
+        # the wizard cannot derive "Method configured" from the file existing.
+        previous = None
+        if self.params_file.exists():
+            try:
+                previous = json.loads(self.params_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                previous = None
+
         # Save to json file
         with open(self.params_file, "w", encoding="utf-8") as f:
             json.dump(json_params, f, indent=4)
+
+        # Only a genuine METHOD change counts; see method_only().
+        if previous is not None and method_only(json_params) != method_only(previous):
+            record_intent(self.params_file.parent, "method")
 
     def get_parameters_from_json(self) -> None:
         """

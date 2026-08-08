@@ -4,22 +4,45 @@ developmentMode = false
 [server]
 port = 8501 # should be same as configured in deployment repo
 
+# Theme derived from the OpenMS design system shipped in the design handoff
+# (design-system/tokens/*.css). Streamlit 1.60 exposes ~50 theme keys, so almost
+# all of it is declarative here rather than CSS injected against Streamlit's
+# internal class names, which is what the old 1.42 pin would have forced.
 [theme]
+base = "light"
 
-# The preset Streamlit theme that your custom theme inherits from. One of "light" or "dark".
-# base =
+# --openms-navy: every action, active nav, header bar.
+primaryColor = "#0c2a60"
+backgroundColor = "#ffffff"
+# --tint-blue: cool bands, active nav row, widget backgrounds.
+secondaryBackgroundColor = "#ecf2f9"
+# --gray-800 (--text-body). 14.8:1 on white.
+textColor = "#222832"
+linkColor = "#0c2a60"
 
-# Primary accent color for interactive elements.
-primaryColor = "#29379b"
+# NOT --gray-300 (#d1d5da). That is 1.47:1 against white, and WCAG 2.1 SC 1.4.11
+# requires 3:1 for the boundary of a UI control. --gray-500 is 4.81:1. The design
+# system's own border token fails, so this deliberately departs from it; see
+# design-reviews/flashviewer-2026-07-29/adversarial-review.md F-29.
+borderColor = "#677384"
+showWidgetBorder = true
 
-# Background color for the main content area.
-# backgroundColor =
+# --radius-md for fields, --radius-pill for buttons.
+baseRadius = "6px"
+buttonRadius = "25px"
 
-# Background color used for the sidebar and most interactive widgets.
-# secondaryBackgroundColor =
+# The design system ships no webfont: the site renders in the system UI stack.
+font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+codeFont = "SFMono-Regular, Menlo, Consolas, Monaco, 'Liberation Mono', monospace"
 
-# Color used for almost all text.
-# textColor =
+# Status palette. The shipped design system has none — no success, warning or
+# danger token exists in tokens/*.css — but the preset availability UI is built
+# on all three. These are the values the handoff README uses, kept because each
+# passes AA on white: 5.17:1, 5.93:1, 6.04:1.
+greenColor = "#1c7c54"
+orangeColor = "#8a5a00"
+redColor = "#b1382f"
 
-# Font family for all text in the app, except code blocks. One of "sans serif", "serif", or "monospace".
-# font =
+# The OpenMS logo spectrum, amber through blue. Data only — never a button fill.
+chartCategoricalColors = ["#ffb401", "#ff7501", "#ff4e44", "#ff15ad", "#ff03cb", "#b503ff", "#762cf5", "#3157e9"]

@@ -101,11 +101,11 @@ with st.form('sequence_input'):
             st.error('Error: sequence input is not valid')
 
 st.info("""
-**💡 NOTE** 
+**NOTE** 
 
-- This is only needed when the "Sequence View" component will be used in 👀Viewer
+- This is only needed when the "Sequence View" component will be used in Viewer
         
-- Variable modifications can be specified within the ”Sequence View” component in 👀Viewer.
+- Variable modifications can be specified within the ”Sequence View” component in Viewer.
 
 - Only one protein sequence is allowed
 """)

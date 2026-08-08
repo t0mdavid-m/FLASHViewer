@@ -10,7 +10,7 @@ from src.components import flash_viewer_grid_component, FlashViewerComponent, FL
 # page initialization
 params = page_setup()
 
-st.title('FLASHViewer')
+st.title('Viewer')
 
 # Get available results
 file_manager = FileManager(
@@ -23,7 +23,14 @@ results = file_manager.get_results_list(
 
 ### if no input file is given, show blank page
 if len(results) == 0:
-    st.error('No results to show yet. Please run a workflow first!')
+    # Not an error, and not conditional on a run this app performed:
+    # finished FLASH* output added under 'Add results' is equally valid.
+    st.info(
+        "**Nothing to explore in this workspace yet.**\n\n"
+        "Either run an analysis on the FLASHQuant **Workflow** page, or add "
+        "finished FLASH\\* output under its **Add results** tab — the viewer "
+        "treats both the same."
+    )
     st.stop()
 
 # Map names to index

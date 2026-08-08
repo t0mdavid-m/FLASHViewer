@@ -49,10 +49,25 @@ else:
             if clicked:
                 button_placeholder.empty()
                 with st.spinner():
-                    # Create ZIP file
-                    if not file_manager.result_exists(
-                        experiment, 'download_archive'
-                    ):
+                    # Create ZIP file.
+                    # Rebuild when any member is newer than the archive: the
+                    # archive used to be cached forever, so re-running a dataset
+                    # served the previous run's results under the same name.
+                    stale = True
+                    if file_manager.result_exists(experiment, 'download_archive'):
+                        archive = Path(file_manager.get_results(
+                            experiment, ['download_archive']
+                        )['download_archive'])
+                        if archive.exists():
+                            members = file_manager.get_results(
+                                experiment, targets, partial=True
+                            ).values()
+                            newest = max(
+                                (Path(m).stat().st_mtime for m in members
+                                 if Path(m).exists()), default=0
+                            )
+                            stale = newest > archive.stat().st_mtime
+                    if stale:
                         zip_buffer = BytesIO()
                         with ZipFile(zip_buffer, 'w', ZIP_DEFLATED) as f:
                             for filepath in file_manager.get_results(
@@ -70,12 +85,12 @@ else:
                     # Show download button after ZIP file was created
                     with open(out_zip, 'rb') as f:
                         button_placeholder.download_button(
-                            "Download ⬇️", f, 
+                            "Download ", f, 
                             file_name = f'{experiment}.zip',
                             use_container_width=True
                         )
 
         with columns[2]:
-            if st.button(f"🗑️ {experiment}", use_container_width=True):
+            if st.button(f"{experiment}", use_container_width=True):
                 file_manager.remove_results(experiment)
                 st.rerun()

@@ -5,7 +5,9 @@ from pathlib import Path
 
 from src.Workflow import DeconvWorkflow
 from src.parse.deconv import parseDeconv
-from src.common.common import page_setup
+from src.common.common import page_setup, desktop_file_picker
+from src.workflow.StreamlitUI import DESKTOP
+from src import confirm
 
 
 params = page_setup()
@@ -14,7 +16,18 @@ wf = DeconvWorkflow()
 
 st.title('FLASHDeconv - Ultrafast Deconvolution')
 
-t = st.tabs(["📁 **File Upload**", "⚙️ **Configure**", "🚀 **Run**", "💡 **Manual Result Upload**"])
+# Wizard banner. Mounted ABOVE st.tabs deliberately: it must not sit inside a
+# tab body, because st.tabs renders every body on load and execution() depends
+# on that. State is derived in src/tools.py; nothing here constructs a
+# FileManager for another tool.
+from src import wizard
+from src.tools import TOOLS
+_spec = TOOLS["FLASHDeconv"]
+_files_dir = Path(wf.workflow_dir, "input-files", "mzML-files")
+_selected = wizard.selected_names(wf.params, "mzML-files")
+wizard.banner(wizard.build_steps(_spec, wf, wf.params, _files_dir, _selected))
+
+t = st.tabs(["**Data**", "**Method**", "**Run**", "**Add results**"])
 with t[0]:
     wf.show_file_upload_section()
 
@@ -71,8 +84,14 @@ with t[3]:
             ) & input_files
         )
 
-        # Process unparsed datasets
-        for unparsed_dataset in (unparsed_files | unparsed_tsv_files):
+        # Process unparsed datasets. Parsing is a phase of the work, not a
+        # silent gap after it: on real data this runs for minutes.
+        pending = sorted(unparsed_files | unparsed_tsv_files)
+        if pending:
+            _status = st.status(f"Parsing {len(pending)} dataset(s)…", expanded=True)
+            _progress = _status.progress(0.0)
+        for _i, unparsed_dataset in enumerate(pending):
+            _status.write(f"Parsing {unparsed_dataset} ({_i + 1}/{len(pending)})")
             results = wf.file_manager.get_results(
                 unparsed_dataset, 
                 ['out_deconv_mzML', 'anno_annotated_mzML', 
@@ -84,6 +103,11 @@ with t[3]:
 
             for k, v in parsed_data.items():
                 wf.file_manager.store_data(unparsed_dataset, k, v)
+            _progress.progress((_i + 1) / len(pending))
+
+        if pending:
+            _status.update(label=f"Parsed {len(pending)} dataset(s)", state="complete",
+                           expanded=False)
 
     # make directory to store deconv and anno mzML files & initialize data storage
     tabs = st.tabs(["File Upload", "Example Data"])
@@ -107,20 +131,30 @@ with t[3]:
             st.success("Example files loaded!")
 
     with tabs[0]:
-        st.subheader("**Upload FLASHDeconv output files (\*_annotated.mzML & \*_deconv.mzML) or spec1/2 TSV files (ECDF Plot only)**")
+        st.subheader("**Add FLASHDeconv output files (\*_annotated.mzML & \*_deconv.mzML) or spec1/2 TSV files (ECDF Plot only)**")
         st.info(
             """
-            **💡 How to upload files**
+            **How to add files**
 
             1. Browse files on your computer or drag and drops files
             2. Click the **Add the uploaded files** button to use them in the workflows
 
             Select data for analysis from the uploaded files shown below.
 
-            **💡 Make sure that the same number of deconvolved and annotated mzML files are uploaded!**
+            **Make sure that the same number of deconvolved and annotated mzML files are uploaded!**
             """
         )
-        with st.form('input_files', clear_on_submit=True):
+        if DESKTOP:
+            # No upload step: reference the files where they already are.
+            picked = desktop_file_picker(
+                "Add FLASHDeconv output files", ["mzML", "tsv"], key="fd_pick"
+            )
+            if picked:
+                process_uploaded_files(picked)
+                st.success(f"Added {len(picked)} file(s).")
+                st.rerun()
+        else:
+          with st.form('input_files', clear_on_submit=True):
             uploaded_files = st.file_uploader(
                 "FLASHDeconv output mzML files or TSV files", accept_multiple_files=True, type=["mzML", "tsv"]
             )
@@ -177,7 +211,7 @@ with t[3]:
     st.dataframe(pd.DataFrame(table))
 
     # Remove files
-    with st.expander("🗑️ Remove mzML files"):
+    with st.expander("Remove datasets"):
         to_remove = st.multiselect(
             "select files", options=experiments
         )
@@ -189,7 +223,20 @@ with t[3]:
                 wf.file_manager.remove_results(dataset_id)
             st.rerun()
 
-        if c1.button("⚠️ Remove **all**"):
-            wf.file_manager.clear_cache()
-            st.success("All files removed!")
-            st.rerun()
+        # Unbounded and unrecoverable: clear_cache() drops both SQLite tables and
+        # rmtree's <cache>/files. It had no confirmation at all.
+        if c1.button("Remove **all**", icon=":material/delete_forever:"):
+            st.session_state["armed_clear_FLASHDeconv"] = True
+        if st.session_state.get("armed_clear_FLASHDeconv"):
+            def _clear_FLASHDeconv():
+                wf.file_manager.clear_cache()
+                st.session_state.pop("armed_clear_FLASHDeconv", None)
+                st.rerun()
+            confirm.confirm_typed(
+                title="Remove every FLASHDeconv dataset",
+                body="This deletes every dataset in this workspace for FLASHDeconv, "
+                     "including parsed results. It cannot be undone.",
+                phrase="FLASHDeconv",
+                confirm_label="Remove all FLASHDeconv datasets",
+                on_confirm=_clear_FLASHDeconv,
+            )
